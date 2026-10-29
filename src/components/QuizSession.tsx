@@ -13,15 +13,27 @@ import {
   promptOf,
   type QuizDirection,
 } from "@/lib/quiz";
-import { clearDeck, loadDeck, saveDeck } from "@/lib/storage";
+import {
+  type ActiveSession,
+  type FeedbackSnapshot,
+  type HistoryEntry,
+  addHistoryEntry,
+  clearActiveSession,
+  clearDeck,
+  clearHistory,
+  formatHistoryDate,
+  loadActiveSession,
+  loadDeck,
+  loadHistory,
+  loadSettings,
+  newId,
+  removeHistoryEntry,
+  saveActiveSession,
+  saveDeck,
+  saveSettings,
+} from "@/lib/storage";
 
 type Phase = "home" | "quiz" | "done";
-
-type Feedback = {
-  kind: "correct" | "wrong" | "reask";
-  line: string;
-};
-
 type SessionSize = "all" | 10 | 20 | 30;
 
 export default function QuizSession() {
@@ -35,13 +47,16 @@ export default function QuizSession() {
   const [direction, setDirection] = useState<QuizDirection>("de-fa");
   const [sessionSize, setSessionSize] = useState<SessionSize>("all");
   const [hydrated, setHydrated] = useState(false);
+  const [history, setHistory] = useState<HistoryEntry[]>([]);
+  const [pausedSession, setPausedSession] = useState<ActiveSession | null>(null);
 
+  const [sessionId, setSessionId] = useState<string>("");
   const [queue, setQueue] = useState<number[]>([]);
   const [currentId, setCurrentId] = useState<number | null>(null);
   const [options, setOptions] = useState<string[]>([]);
   const [answered, setAnswered] = useState(false);
   const [selected, setSelected] = useState<string | null>(null);
-  const [feedback, setFeedback] = useState<Feedback | null>(null);
+  const [feedback, setFeedback] = useState<FeedbackSnapshot | null>(null);
   const [asked, setAsked] = useState(0);
   const [correctCount, setCorrectCount] = useState(0);
   const [wrongCount, setWrongCount] = useState(0);
@@ -52,14 +67,131 @@ export default function QuizSession() {
   const fileRef = useRef<HTMLInputElement>(null);
   const nextBtnRef = useRef<HTMLButtonElement>(null);
   const pickRef = useRef<(choice: string) => void>(() => {});
+  const skipSaveRef = useRef(true);
   const [dragOver, setDragOver] = useState(false);
+
+  const applySessionSnapshot = useCallback((session: ActiveSession) => {
+    setSessionId(session.id);
+    setTitle(session.title);
+    setActiveWords(session.activeWords);
+    setDirection(session.direction);
+    setQueue(session.queue);
+    setCurrentId(session.currentId);
+    setOptions(session.options);
+    setAnswered(session.answered);
+    setSelected(session.selected);
+    setFeedback(session.feedback);
+    setAsked(session.asked);
+    setCorrectCount(session.correctCount);
+    setWrongCount(session.wrongCount);
+    setLearnedLines(session.learnedLines);
+    setSessionTotal(session.sessionTotal);
+    setMissedIds(session.missedIds);
+    setPhase(session.phase);
+  }, []);
 
   useEffect(() => {
     const deck = loadDeck();
+    const settings = loadSettings();
     setTitle(deck.title);
     setWords(deck.items);
+    setPasteText(deck.pasteText ?? "");
+    setDirection(settings.direction);
+    setSessionSize(settings.sessionSize);
+    setHistory(loadHistory());
+
+    const active = loadActiveSession();
+    if (active?.phase === "quiz") {
+      // Resume mid-exam immediately after refresh
+      applySessionSnapshot(active);
+      setPausedSession(null);
+    } else if (active?.phase === "done") {
+      // Finished exam left in storage — archive once, then home
+      const total = active.correctCount + active.wrongCount;
+      const already = loadHistory().some((h) => h.id === active.id);
+      if (!already) {
+        setHistory(
+          addHistoryEntry({
+            id: active.id,
+            title: active.title,
+            direction: active.direction,
+            words: active.activeWords,
+            asked: active.asked,
+            correctCount: active.correctCount,
+            wrongCount: active.wrongCount,
+            accuracy:
+              total > 0
+                ? Math.round((active.correctCount / total) * 100)
+                : 0,
+            learnedLines: active.learnedLines,
+            missedIds: active.missedIds,
+            finishedAt: Date.now(),
+            completed: true,
+          }),
+        );
+      }
+      clearActiveSession();
+      setPausedSession(null);
+      setPhase("home");
+    } else {
+      setPausedSession(null);
+    }
+
+    skipSaveRef.current = false;
     setHydrated(true);
-  }, []);
+  }, [applySessionSnapshot]);
+
+  useEffect(() => {
+    if (!hydrated) return;
+    saveSettings({ direction, sessionSize });
+  }, [hydrated, direction, sessionSize]);
+
+  useEffect(() => {
+    if (!hydrated || skipSaveRef.current) return;
+    if (phase !== "quiz") return;
+    if (!sessionId || activeWords.length === 0) return;
+
+    const snapshot: ActiveSession = {
+      id: sessionId,
+      title,
+      direction,
+      activeWords,
+      queue,
+      currentId,
+      options,
+      answered,
+      selected,
+      feedback,
+      asked,
+      correctCount,
+      wrongCount,
+      learnedLines,
+      sessionTotal,
+      missedIds,
+      phase: "quiz",
+      updatedAt: Date.now(),
+    };
+    saveActiveSession(snapshot);
+  }, [
+    hydrated,
+    phase,
+    sessionId,
+    title,
+    direction,
+    activeWords,
+    queue,
+    currentId,
+    options,
+    answered,
+    selected,
+    feedback,
+    asked,
+    correctCount,
+    wrongCount,
+    learnedLines,
+    sessionTotal,
+    missedIds,
+  ]);
 
   const current = useMemo(
     () =>
@@ -70,7 +202,9 @@ export default function QuizSession() {
   const remaining = queue.length + (currentId != null && !answered ? 1 : 0);
   const progressDone = Math.max(0, sessionTotal - remaining);
   const progressPct =
-    sessionTotal > 0 ? Math.min(100, Math.round((progressDone / sessionTotal) * 100)) : 0;
+    sessionTotal > 0
+      ? Math.min(100, Math.round((progressDone / sessionTotal) * 100))
+      : 0;
 
   const applyImport = useCallback((raw: string) => {
     const result = parseVocabularyText(raw);
@@ -83,11 +217,11 @@ export default function QuizSession() {
     }
     setWords(result.items);
     setTitle(result.title);
-    saveDeck(result.title, result.items);
+    saveDeck(result.title, result.items, raw);
     setPasteText(raw);
     setImportError(null);
     setImportMsg(
-      `${result.items.length} واژه بارگذاری شد` +
+      `${result.items.length} واژه بارگذاری و ذخیره شد` +
         (result.skipped ? ` · ${result.skipped} خط رد شد` : ""),
     );
   }, []);
@@ -95,12 +229,8 @@ export default function QuizSession() {
   function onFileChange(file: File | null) {
     if (!file) return;
     const reader = new FileReader();
-    reader.onload = () => {
-      applyImport(String(reader.result ?? ""));
-    };
-    reader.onerror = () => {
-      setImportError("خواندن فایل ناموفق بود.");
-    };
+    reader.onload = () => applyImport(String(reader.result ?? ""));
+    reader.onerror = () => setImportError("خواندن فایل ناموفق بود.");
     reader.readAsText(file, "UTF-8");
   }
 
@@ -124,6 +254,35 @@ export default function QuizSession() {
     URL.revokeObjectURL(url);
   }
 
+  function buildHistoryEntry(
+    completed: boolean,
+    override?: Partial<HistoryEntry>,
+  ): HistoryEntry {
+    const total = correctCount + wrongCount;
+    return {
+      id: sessionId || newId(),
+      title,
+      direction,
+      words: activeWords,
+      asked,
+      correctCount,
+      wrongCount,
+      accuracy: total > 0 ? Math.round((correctCount / total) * 100) : 0,
+      learnedLines,
+      missedIds,
+      finishedAt: Date.now(),
+      completed,
+      ...override,
+    };
+  }
+
+  function finishToHistory(completed: boolean) {
+    const entry = buildHistoryEntry(completed);
+    setHistory(addHistoryEntry(entry));
+    clearActiveSession();
+    setPausedSession(null);
+  }
+
   function present(
     id: number,
     nextQueue: number[],
@@ -141,30 +300,128 @@ export default function QuizSession() {
     setAsked((n) => n + 1);
   }
 
-  function startSession(focusMissed = false) {
-    const source =
-      focusMissed && missedIds.length > 0
-        ? words.filter((w) => missedIds.includes(w.id))
-        : words;
-
+  function beginWithSource(
+    source: VocabItem[],
+    dir: QuizDirection,
+    limit?: number,
+    listTitle?: string,
+  ) {
     if (source.length === 0) {
       setImportError("لیست واژه خالی است. اول متن را آپلود یا پیست کن.");
       return;
     }
 
-    const limit =
-      focusMissed || sessionSize === "all" ? undefined : sessionSize;
+    // If an unfinished session exists, archive it before starting a new one
+    const existing = loadActiveSession();
+    if (existing?.phase === "quiz" && existing.asked > 0) {
+      const total = existing.correctCount + existing.wrongCount;
+      setHistory(
+        addHistoryEntry({
+          id: existing.id,
+          title: existing.title,
+          direction: existing.direction,
+          words: existing.activeWords,
+          asked: existing.asked,
+          correctCount: existing.correctCount,
+          wrongCount: existing.wrongCount,
+          accuracy:
+            total > 0
+              ? Math.round((existing.correctCount / total) * 100)
+              : 0,
+          learnedLines: existing.learnedLines,
+          missedIds: existing.missedIds,
+          finishedAt: Date.now(),
+          completed: false,
+        }),
+      );
+    }
+
     const q = buildSessionQueue(source, limit);
     const [first, ...rest] = q;
+    const id = newId();
+    setSessionId(id);
+    if (listTitle) setTitle(listTitle);
     setActiveWords(source);
+    setDirection(dir);
     setCorrectCount(0);
     setWrongCount(0);
     setLearnedLines([]);
     setAsked(0);
     setMissedIds([]);
     setSessionTotal(q.length);
+    setPausedSession(null);
     setPhase("quiz");
-    present(first, rest, source, direction);
+    present(first, rest, source, dir);
+  }
+
+  function startSession(focusMissed = false) {
+    const source =
+      focusMissed && missedIds.length > 0
+        ? activeWords.filter((w) => missedIds.includes(w.id))
+        : words;
+    const limit =
+      focusMissed || sessionSize === "all" ? undefined : sessionSize;
+    beginWithSource(source, direction, limit);
+  }
+
+  function resumePausedOrActive() {
+    const active = loadActiveSession() ?? pausedSession;
+    if (!active) return;
+    applySessionSnapshot(active);
+    setPausedSession(null);
+  }
+
+  function redoHistory(entry: HistoryEntry) {
+    beginWithSource(entry.words, entry.direction, undefined, entry.title);
+  }
+
+  function redoMissedFromHistory(entry: HistoryEntry) {
+    const missed = entry.words.filter((w) => entry.missedIds.includes(w.id));
+    if (missed.length === 0) {
+      beginWithSource(entry.words, entry.direction, undefined, entry.title);
+      return;
+    }
+    beginWithSource(missed, entry.direction, undefined, entry.title);
+  }
+
+  function goHome(pause = true) {
+    if (phase === "quiz" && pause && sessionId) {
+      const snapshot: ActiveSession = {
+        id: sessionId,
+        title,
+        direction,
+        activeWords,
+        queue,
+        currentId,
+        options,
+        answered,
+        selected,
+        feedback,
+        asked,
+        correctCount,
+        wrongCount,
+        learnedLines,
+        sessionTotal,
+        missedIds,
+        phase: "quiz",
+        updatedAt: Date.now(),
+      };
+      saveActiveSession(snapshot);
+      setPausedSession(snapshot);
+    }
+    setPhase("home");
+  }
+
+  function discardActive() {
+    if (phase === "quiz" && asked > 0) {
+      finishToHistory(false);
+    } else {
+      clearActiveSession();
+    }
+    setPausedSession(null);
+    setPhase("home");
+    setCurrentId(null);
+    setQueue([]);
   }
 
   function goNext(nextQueue: number[]) {
@@ -197,7 +454,6 @@ export default function QuizSession() {
 
     setCorrectCount((n) => n + 1);
     setLearnedLines((prev) => (prev.includes(line) ? prev : [...prev, line]));
-
     const shouldReask = Math.random() < REASK_CORRECT_CHANCE;
     setFeedback({ kind: shouldReask ? "reask" : "correct", line });
   }
@@ -206,13 +462,29 @@ export default function QuizSession() {
 
   function continueAfterAnswer() {
     if (!current || !feedback) return;
-
     if (feedback.kind === "wrong" || feedback.kind === "reask") {
       goNext(insertRandomly(queue, current.id));
       return;
     }
     goNext(queue);
   }
+
+  // Persist completed exam once when entering done
+  const completedSavedRef = useRef<string | null>(null);
+  useEffect(() => {
+    if (phase !== "done" || !sessionId) return;
+    if (completedSavedRef.current === sessionId) return;
+    completedSavedRef.current = sessionId;
+    const already = loadHistory().some((h) => h.id === sessionId);
+    if (!already) {
+      setHistory(addHistoryEntry(buildHistoryEntry(true)));
+    } else {
+      setHistory(loadHistory());
+    }
+    clearActiveSession();
+    setPausedSession(null);
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- save once per finished session id
+  }, [phase, sessionId]);
 
   useEffect(() => {
     if (phase !== "quiz") return;
@@ -244,6 +516,9 @@ export default function QuizSession() {
   }
 
   if (phase === "home") {
+    const resumable = pausedSession ?? loadActiveSession();
+    const canResume = resumable?.phase === "quiz";
+
     return (
       <div className="mx-auto flex w-full max-w-2xl flex-col gap-7 px-4 py-10" dir="rtl">
         <header className="space-y-3 text-center">
@@ -252,10 +527,36 @@ export default function QuizSession() {
           </p>
           <h1 className="text-3xl font-bold text-ink">تمرین واژه‌های آلمانی</h1>
           <p className="text-base leading-8 text-ink/70">
-            لیست را با همان قالب آپلود یا پیست کن، بعد جلسه را شروع کن. ترتیب
-            تصادفی است؛ اشتباه‌ها دوباره می‌آیند و گاهی جواب درست هم تکرار می‌شود.
+            لیست آپلودشده و جلسهٔ نیمه‌کاره در همین مرورگر ذخیره می‌شوند. تاریخچهٔ
+            آزمون‌ها را هم می‌توانی دوباره بزنی.
           </p>
         </header>
+
+        {canResume && resumable && (
+          <section className="rounded-2xl border border-accent/30 bg-accent/5 p-5 shadow-sm space-y-3">
+            <h2 className="text-lg font-semibold text-ink">جلسهٔ نیمه‌کاره</h2>
+            <p className="text-sm leading-7 text-ink/70">
+              «{resumable.title}» · سؤال {resumable.asked} · ✓{" "}
+              {resumable.correctCount} · ✗ {resumable.wrongCount}
+            </p>
+            <div className="flex flex-wrap gap-2">
+              <button
+                type="button"
+                onClick={resumePausedOrActive}
+                className="rounded-lg bg-accent px-4 py-2 text-sm font-semibold text-white hover:bg-accent-dark"
+              >
+                ادامه جلسه
+              </button>
+              <button
+                type="button"
+                onClick={discardActive}
+                className="rounded-lg border border-ink/15 px-4 py-2 text-sm text-ink/70"
+              >
+                رد کردن و ذخیره در تاریخچه
+              </button>
+            </div>
+          </section>
+        )}
 
         <section className="rounded-2xl border border-ink/10 bg-white/80 p-5 shadow-sm space-y-4">
           <h2 className="text-lg font-semibold text-ink">بارگذاری لیست</h2>
@@ -327,7 +628,10 @@ export default function QuizSession() {
 
           <textarea
             value={pasteText}
-            onChange={(e) => setPasteText(e.target.value)}
+            onChange={(e) => {
+              setPasteText(e.target.value);
+              saveDeck(title, words, e.target.value);
+            }}
             placeholder={`Arbeitsbuch Wörter\n\n1. die Vorlesung — جلسهٔ درس دانشگاهی، سخنرانی آموزشی\n2. verfügbar — در دسترس، موجود`}
             rows={7}
             className="w-full resize-y rounded-xl border border-ink/15 bg-paper px-3 py-2 text-sm leading-7 text-ink outline-none focus:border-accent"
@@ -388,6 +692,85 @@ export default function QuizSession() {
           </button>
         </section>
 
+        <section className="rounded-2xl border border-ink/10 bg-white/80 p-5 shadow-sm space-y-4">
+          <div className="flex items-center justify-between gap-3">
+            <h2 className="text-lg font-semibold">تاریخچهٔ آزمون‌ها</h2>
+            {history.length > 0 && (
+              <button
+                type="button"
+                onClick={() => {
+                  clearHistory();
+                  setHistory([]);
+                }}
+                className="text-xs text-ink/45 hover:text-red-700"
+              >
+                پاک کردن همه
+              </button>
+            )}
+          </div>
+
+          {history.length === 0 ? (
+            <p className="text-sm text-ink/55">هنوز آزمونی ذخیره نشده.</p>
+          ) : (
+            <ul className="space-y-3">
+              {history.map((entry) => (
+                <li
+                  key={entry.id}
+                  className="rounded-xl border border-ink/10 bg-paper px-4 py-3"
+                >
+                  <div className="flex flex-wrap items-start justify-between gap-2">
+                    <div>
+                      <p className="font-semibold text-ink" dir="ltr">
+                        {entry.title}
+                      </p>
+                      <p className="mt-1 text-xs text-ink/55">
+                        {formatHistoryDate(entry.finishedAt)} ·{" "}
+                        {entry.completed ? "تمام‌شده" : "ناتمام"} ·{" "}
+                        {entry.direction === "de-fa"
+                          ? "آ→ف"
+                          : "ف→آ"}{" "}
+                        · دقت {entry.accuracy}%
+                      </p>
+                      <p className="mt-1 text-sm text-ink/70">
+                        {entry.asked} سؤال · ✓ {entry.correctCount} · ✗{" "}
+                        {entry.wrongCount}
+                        {entry.missedIds.length > 0
+                          ? ` · ${entry.missedIds.length} اشتباه`
+                          : ""}
+                      </p>
+                    </div>
+                    <div className="flex flex-wrap gap-2">
+                      <button
+                        type="button"
+                        onClick={() => redoHistory(entry)}
+                        className="rounded-lg bg-accent px-3 py-1.5 text-xs font-semibold text-white"
+                      >
+                        دوباره
+                      </button>
+                      {entry.missedIds.length > 0 && (
+                        <button
+                          type="button"
+                          onClick={() => redoMissedFromHistory(entry)}
+                          className="rounded-lg border border-amber-300 bg-amber-50 px-3 py-1.5 text-xs font-semibold text-amber-950"
+                        >
+                          فقط اشتباه‌ها
+                        </button>
+                      )}
+                      <button
+                        type="button"
+                        onClick={() => setHistory(removeHistoryEntry(entry.id))}
+                        className="rounded-lg border border-ink/10 px-3 py-1.5 text-xs text-ink/50"
+                      >
+                        حذف
+                      </button>
+                    </div>
+                  </div>
+                </li>
+              ))}
+            </ul>
+          )}
+        </section>
+
         <section className="rounded-2xl border border-ink/10 bg-white/70 p-5 shadow-sm">
           <h2 className="mb-4 text-lg font-semibold text-ink" dir="ltr">
             {title}
@@ -421,8 +804,10 @@ export default function QuizSession() {
         <header className="space-y-2 text-center">
           <h1 className="text-3xl font-bold text-ink">جلسه تمام شد</h1>
           <p className="text-ink/70">
-            {asked} سؤال · {correctCount} درست · {wrongCount} اشتباه · دقت {accuracy}%
+            {asked} سؤال · {correctCount} درست · {wrongCount} اشتباه · دقت{" "}
+            {accuracy}%
           </p>
+          <p className="text-sm text-green-800">در تاریخچه ذخیره شد.</p>
         </header>
 
         <section className="rounded-2xl border border-ink/10 bg-white/70 p-5 shadow-sm">
@@ -463,7 +848,11 @@ export default function QuizSession() {
           </button>
           <button
             type="button"
-            onClick={() => setPhase("home")}
+            onClick={() => {
+              clearActiveSession();
+              setPhase("home");
+              setHistory(loadHistory());
+            }}
             className="rounded-xl border border-ink/15 px-6 py-3 font-semibold text-ink"
           >
             بازگشت به خانه
@@ -490,13 +879,23 @@ export default function QuizSession() {
             style={{ width: `${progressPct}%` }}
           />
         </div>
-        <button
-          type="button"
-          onClick={() => setPhase("home")}
-          className="text-xs text-ink/45 hover:text-ink"
-        >
-          پایان زودهنگام و بازگشت
-        </button>
+        <p className="text-xs text-ink/40">پیشرفت این جلسه خودکار ذخیره می‌شود.</p>
+        <div className="flex flex-wrap gap-3">
+          <button
+            type="button"
+            onClick={() => goHome(true)}
+            className="text-xs text-ink/55 hover:text-ink"
+          >
+            توقف و بازگشت (ادامه بعداً)
+          </button>
+          <button
+            type="button"
+            onClick={discardActive}
+            className="text-xs text-ink/40 hover:text-red-700"
+          >
+            لغو جلسه
+          </button>
+        </div>
       </div>
 
       <div className="rounded-2xl border border-ink/10 bg-white/80 p-6 shadow-sm">
@@ -507,9 +906,7 @@ export default function QuizSession() {
           {direction === "de-fa" ? "معنی این واژه چیست؟" : "معادل آلمانی چیست؟"}
         </p>
         <h2
-          className={`mb-6 text-3xl font-bold tracking-tight text-ink ${
-            direction === "de-fa" ? "" : ""
-          }`}
+          className="mb-6 text-3xl font-bold tracking-tight text-ink"
           dir={direction === "de-fa" ? "ltr" : "rtl"}
         >
           {current ? promptOf(current, direction) : ""}
@@ -549,7 +946,9 @@ export default function QuizSession() {
           })}
         </div>
 
-        <p className="mt-3 text-xs text-ink/40">کلید ۱–۴ برای انتخاب · Enter برای بعدی</p>
+        <p className="mt-3 text-xs text-ink/40">
+          کلید ۱–۴ برای انتخاب · Enter برای بعدی
+        </p>
 
         {feedback && (
           <div
